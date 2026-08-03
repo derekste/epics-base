@@ -14,6 +14,13 @@
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
+#include <time.h>
+
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__) || defined(__sun)
+#  include <arpa/nameser.h>
+#  include <resolv.h>
+#  define AS_USE_DNS_TTL 1
+#endif
 
 #include "osiSock.h"
 #include "epicsTypes.h"
@@ -22,6 +29,7 @@
 #include "epicsThread.h"
 #include "cantProceed.h"
 #include "epicsMutex.h"
+#include "epicsString.h"
 #include "errlog.h"
 #include "gpHash.h"
 #include "freeList.h"
@@ -46,6 +54,9 @@ static void         *freeListPvt = NULL;
 
 
 #define DEFAULT "DEFAULT"
+#define AS_HAG_HOST_MAX 512u
+#define AS_HAG_DNS_TTL_FALLBACK 300u
+#define AS_HAG_DNS_RETRY 60u
 
 /* Defined in asLib.y */
 static int myParse(ASINPUTFUNCPTR inputfunction);
@@ -59,6 +70,8 @@ static UAG *asUagAdd(const char *uagName);
 static long asUagAddUser(UAG *puag,const char *user);
 static HAG *asHagAdd(const char *hagName);
 static long asHagAddHost(HAG *phag,const char *host);
+static void asHagAddHashEntries(ASBASE *pasbase);
+static int asHagRefreshExpired(ASBASE *pasbase);
 static ASG *asAsgAdd(const char *asgName);
 static long asAsgAddInp(ASG *pasg,const char *inp,int inpIndex);
 static ASGRULE *asAsgAddRule(ASG *pasg,asAccessRights access,int level);
@@ -85,6 +98,288 @@ static void asInitializeOnce(void *arg)
     osiSockAttach();
     asLock  = epicsMutexMustCreate();
 }
+
+static char *asStrdupConst(const char *str)
+{
+    size_t len = epicsStrnLen(str, AS_HAG_HOST_MAX);
+    char *buf = asCalloc(1, len + 1);
+
+    memcpy(buf, str, len);
+    return buf;
+}
+
+static char *asIPAddrString(const struct sockaddr_in *addr)
+{
+    char buf[24];
+    epicsUInt32 ip = ntohl(addr->sin_addr.s_addr);
+
+    epicsSnprintf(buf, sizeof(buf),
+                  "%u.%u.%u.%u",
+                  (ip>>24)&0xff,
+                  (ip>>16)&0xff,
+                  (ip>>8)&0xff,
+                  (ip>>0)&0xff);
+    return asStrdupConst(buf);
+}
+
+static char *asUnresolvedHostString(const char *host)
+{
+    static const char unresolved[] = "unresolved:";
+    size_t prefixLen = sizeof(unresolved) - 1;
+    size_t hostLen = epicsStrnLen(host, AS_HAG_HOST_MAX);
+    char *buf = asCalloc(1, prefixLen + hostLen + 1);
+
+    memcpy(buf, unresolved, prefixLen);
+    memcpy(buf + prefixLen, host, hostLen);
+    return buf;
+}
+
+static int asSetIPAddr(epicsUInt32 rawAddr, struct sockaddr_in *pIP)
+{
+    static const struct sockaddr_in emptyAddr = {0};
+
+    *pIP = emptyAddr;
+    pIP->sin_family = AF_INET;
+    pIP->sin_addr.s_addr = htonl(rawAddr);
+    return 0;
+}
+
+static int asParseNumericIPAddr(const char *host, struct sockaddr_in *pIP)
+{
+    int status;
+    unsigned addr[4];
+    unsigned long rawAddr;
+    unsigned port;
+    char dummy[8];
+
+    status = sscanf(host, " %u . %u . %u . %u %7s ",
+        addr, addr+1u, addr+2u, addr+3u, dummy);
+    if(status == 4) {
+        if(addr[0] <= 0xff && addr[1] <= 0xff &&
+           addr[2] <= 0xff && addr[3] <= 0xff) {
+            return asSetIPAddr(((epicsUInt32)addr[0] << 24) |
+                               ((epicsUInt32)addr[1] << 16) |
+                               ((epicsUInt32)addr[2] << 8) |
+                               (epicsUInt32)addr[3], pIP);
+        }
+        return -1;
+    }
+
+    status = sscanf(host, " %u . %u . %u . %u : %u %7s ",
+        addr, addr+1u, addr+2u, addr+3u, &port, dummy);
+    if(status == 5 && port <= 0xffff) {
+        if(addr[0] <= 0xff && addr[1] <= 0xff &&
+           addr[2] <= 0xff && addr[3] <= 0xff) {
+            return asSetIPAddr(((epicsUInt32)addr[0] << 24) |
+                               ((epicsUInt32)addr[1] << 16) |
+                               ((epicsUInt32)addr[2] << 8) |
+                               (epicsUInt32)addr[3], pIP);
+        }
+        return -1;
+    }
+
+    status = sscanf(host, " %lu %7s ", &rawAddr, dummy);
+    if(status == 1 && rawAddr <= 0xfffffffful) {
+        return asSetIPAddr((epicsUInt32)rawAddr, pIP);
+    }
+
+    status = sscanf(host, " %lu : %u %7s ", &rawAddr, &port, dummy);
+    if(status == 2 && rawAddr <= 0xfffffffful && port <= 0xffff) {
+        return asSetIPAddr((epicsUInt32)rawAddr, pIP);
+    }
+
+    return -1;
+}
+
+static void asHagSetHost(HAGNAME *phagname, char *host, int resolved)
+{
+    free(phagname->host);
+    phagname->host = host;
+    phagname->resolved = !!resolved;
+}
+
+#ifdef AS_USE_DNS_TTL
+static int asHagDnsTTL(const char *host, const struct in_addr *addr,
+    unsigned *ttl)
+{
+    unsigned char answer[4096];
+    ns_msg handle;
+    int len;
+    int count;
+    int i;
+    int found = 0;
+    unsigned best = 0;
+
+    len = res_query(host, ns_c_in, ns_t_a, answer, sizeof(answer));
+    if(len < 0 || len > (int)sizeof(answer) || ns_initparse(answer, len, &handle))
+        return -1;
+
+    count = ns_msg_count(handle, ns_s_an);
+    for(i = 0; i < count; i++) {
+        ns_rr rr;
+
+        if(ns_parserr(&handle, ns_s_an, i, &rr))
+            continue;
+        if(ns_rr_type(rr) != ns_t_a || ns_rr_class(rr) != ns_c_in)
+            continue;
+        if(ns_rr_rdlen(rr) != sizeof(addr->s_addr))
+            continue;
+        if(memcmp(ns_rr_rdata(rr), &addr->s_addr, sizeof(addr->s_addr)) != 0)
+            continue;
+
+        if(!found || ns_rr_ttl(rr) < best)
+            best = ns_rr_ttl(rr);
+        found = 1;
+    }
+    if(found) {
+        *ttl = best;
+        return 0;
+    }
+    return -1;
+}
+#endif
+
+static void asHagResolveHost(HAGNAME *phagname, const char *host, time_t now)
+{
+    struct sockaddr_in addr;
+    unsigned ttl = AS_HAG_DNS_TTL_FALLBACK;
+
+    if(aToIPAddr(host, 0, &addr)) {
+        errlogPrintf("ACF: Unable to resolve host '%s'\n", host);
+        asHagSetHost(phagname, asUnresolvedHostString(host), 0);
+        phagname->expires = now + AS_HAG_DNS_RETRY;
+        return;
+    }
+
+#ifdef AS_USE_DNS_TTL
+    if(asHagDnsTTL(host, &addr.sin_addr, &ttl))
+        ttl = AS_HAG_DNS_TTL_FALLBACK;
+#endif
+
+    asHagSetHost(phagname, asIPAddrString(&addr), 1);
+    phagname->expires = now + ttl;
+}
+
+static void asHagDeleteHashEntries(ASBASE *pasbase)
+{
+    HAG *phag = (HAG *)ellFirst(&pasbase->hagList);
+
+    while(phag) {
+        HAGNAME *phagname = (HAGNAME *)ellFirst(&phag->list);
+
+        while(phagname) {
+            if(phagname->hashAdded) {
+                gphDelete(pasbase->phash, phagname->host, phag);
+                phagname->hashAdded = 0;
+            }
+            phagname = (HAGNAME *)ellNext(&phagname->node);
+        }
+        phag = (HAG *)ellNext(&phag->node);
+    }
+}
+
+static void asHagAddHashEntries(ASBASE *pasbase)
+{
+    HAG *phag = (HAG *)ellFirst(&pasbase->hagList);
+
+    while(phag) {
+        HAGNAME *phagname = (HAGNAME *)ellFirst(&phag->list);
+
+        while(phagname) {
+            if(phagname->resolved && phagname->host) {
+                GPHENTRY *pgphentry = gphAdd(pasbase->phash, phagname->host, phag);
+
+                if(pgphentry) {
+                    phagname->hashAdded = 1;
+                } else {
+                    errlogPrintf("Duplicated host '%s' in HAG '%s'\n",
+                        phagname->host, phag->name);
+                }
+            }
+            phagname = (HAGNAME *)ellNext(&phagname->node);
+        }
+        phag = (HAG *)ellNext(&phag->node);
+    }
+}
+
+static void asHagScheduleNextExpiry(ASBASE *pasbase)
+{
+    HAG *phag;
+    time_t next = 0;
+    int found = 0;
+
+    if(!pasbase) return;
+    phag = (HAG *)ellFirst(&pasbase->hagList);
+    while(phag) {
+        HAGNAME *phagname = (HAGNAME *)ellFirst(&phag->list);
+
+        while(phagname) {
+            if(phagname->source) {
+                time_t expires = phagname->expires;
+
+                if(expires <= 0)
+                    expires = 1;
+                if(!found || difftime(expires, next) < 0.0) {
+                    next = expires;
+                    found = 1;
+                }
+            }
+            phagname = (HAGNAME *)ellNext(&phagname->node);
+        }
+        phag = (HAG *)ellNext(&phag->node);
+    }
+    pasbase->hagExpires = found ? next : 0;
+}
+
+static int asHagRefreshExpired(ASBASE *pasbase)
+{
+    HAG *phag;
+    HAGNAME *phagname;
+    time_t now;
+    int expired = 0;
+
+    if(!asCheckClientIP || !pasbase || !pasbase->hagExpires)
+        return 0;
+
+    now = time(NULL);
+    if(now == (time_t)-1)
+        return 0;
+    if(difftime(now, pasbase->hagExpires) < 0.0)
+        return 0;
+
+    phag = (HAG *)ellFirst(&pasbase->hagList);
+    while(phag && !expired) {
+        phagname = (HAGNAME *)ellFirst(&phag->list);
+        while(phagname) {
+            if(phagname->source && difftime(now, phagname->expires) >= 0.0) {
+                expired = 1;
+                break;
+            }
+            phagname = (HAGNAME *)ellNext(&phagname->node);
+        }
+        phag = (HAG *)ellNext(&phag->node);
+    }
+    if(!expired) {
+        asHagScheduleNextExpiry(pasbase);
+        return 0;
+    }
+
+    asHagDeleteHashEntries(pasbase);
+    phag = (HAG *)ellFirst(&pasbase->hagList);
+    while(phag) {
+        phagname = (HAGNAME *)ellFirst(&phag->list);
+        while(phagname) {
+            if(phagname->source && difftime(now, phagname->expires) >= 0.0)
+                asHagResolveHost(phagname, phagname->source, now);
+            phagname = (HAGNAME *)ellNext(&phagname->node);
+        }
+        phag = (HAG *)ellNext(&phag->node);
+    }
+    asHagAddHashEntries(pasbase);
+    asHagScheduleNextExpiry(pasbase);
+    return 1;
+}
+
 long epicsStdCall asInitialize(ASINPUTFUNCPTR inputfunction)
 {
     ASG         *pasg;
@@ -93,8 +388,6 @@ long epicsStdCall asInitialize(ASINPUTFUNCPTR inputfunction)
     GPHENTRY    *pgphentry;
     UAG         *puag;
     UAGNAME     *puagname;
-    HAG         *phag;
-    HAGNAME     *phagname;
     static epicsThreadOnceId asInitializeOnceFlag = EPICS_THREAD_ONCE_INIT;
 
     epicsThreadOnce(&asInitializeOnceFlag,asInitializeOnce,(void *)0);
@@ -132,19 +425,8 @@ long epicsStdCall asInitialize(ASINPUTFUNCPTR inputfunction)
         }
         puag = (UAG *)ellNext(&puag->node);
     }
-    phag = (HAG *)ellFirst(&pasbasenew->hagList);
-    while(phag) {
-        phagname = (HAGNAME *)ellFirst(&phag->list);
-        while(phagname) {
-            pgphentry = gphAdd(pasbasenew->phash,phagname->host,phag);
-            if(!pgphentry) {
-                errlogPrintf("Duplicated host '%s' in HAG '%s'\n",
-                    phagname->host, phag->name);
-            }
-            phagname = (HAGNAME *)ellNext(&phagname->node);
-        }
-        phag = (HAG *)ellNext(&phag->node);
-    }
+    asHagAddHashEntries(pasbasenew);
+    asHagScheduleNextExpiry(pasbasenew);
     pasbaseold = (ASBASE *)pasbase;
     pasbase = (ASBASE volatile *)pasbasenew;
     if(pasbaseold) {
@@ -496,6 +778,22 @@ long epicsStdCall asCompute(ASCLIENTPVT asClientPvt)
     LOCK;
     status = asComputePvt(asClientPvt);
     UNLOCK;
+    return(status);
+}
+
+long epicsStdCall asRefreshHag(unsigned *changed)
+{
+    int refreshed;
+    long status = 0;
+
+    if(changed) *changed = 0;
+    if(!asActive) return(S_asLib_asNotActive);
+    LOCK;
+    refreshed = asHagRefreshExpired((ASBASE *)pasbase);
+    if(refreshed)
+        status = asComputeAllAsgPvt();
+    UNLOCK;
+    if(changed) *changed = !!refreshed;
     return(status);
 }
 
@@ -1088,6 +1386,8 @@ void asFreeAll(ASBASE *pasbase)
         while(phagname) {
             pnext = ellNext(&phagname->node);
             ellDelete(&phag->list,&phagname->node);
+            free(phagname->host);
+            free(phagname->source);
             free(phagname);
             phagname = pnext;
         }
@@ -1220,35 +1520,27 @@ static long asHagAddHost(HAG *phag,const char *host)
     HAGNAME *phagname;
 
     if (!phag) return 0;
+    phagname = asCalloc(1, sizeof(*phagname));
     if(!asCheckClientIP) {
         size_t i, len = strlen(host);
-        phagname = asCalloc(1, sizeof(*phagname) + len);
+        phagname->host = asCalloc(1, len + 1);
         for (i = 0; i < len; i++) {
             phagname->host[i] = (char)tolower((int)host[i]);
         }
+        phagname->resolved = 1;
 
     } else {
         struct sockaddr_in addr;
-        epicsUInt32 ip;
+        time_t now = time(NULL);
 
-        if(aToIPAddr(host, 0, &addr)) {
-            static const char unresolved[] = "unresolved:";
-
-            errlogPrintf("ACF: Unable to resolve host '%s'\n", host);
-
-            phagname = asCalloc(1, sizeof(*phagname) + sizeof(unresolved)-1+strlen(host));
-            strcpy(phagname->host, unresolved);
-            strcat(phagname->host, host);
-
+        if(now == (time_t)-1)
+            now = 0;
+        if(asParseNumericIPAddr(host, &addr)==0) {
+            phagname->host = asIPAddrString(&addr);
+            phagname->resolved = 1;
         } else {
-            ip = ntohl(addr.sin_addr.s_addr);
-            phagname = asCalloc(1, sizeof(*phagname) + 24);
-            epicsSnprintf(phagname->host, 24,
-                          "%u.%u.%u.%u",
-                          (ip>>24)&0xff,
-                          (ip>>16)&0xff,
-                          (ip>>8)&0xff,
-                          (ip>>0)&0xff);
+            phagname->source = asStrdupConst(host);
+            asHagResolveHost(phagname, host, now);
         }
     }
     ellAdd(&phag->list, &phagname->node);

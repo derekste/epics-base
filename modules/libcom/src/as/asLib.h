@@ -13,6 +13,8 @@
 #ifndef INCasLibh
 #define INCasLibh
 
+#include <time.h>
+
 #include "libComAPI.h"
 #include "ellLib.h"
 #include "errMdef.h"
@@ -25,7 +27,7 @@ extern "C" {
 struct dbChannel;
 
 /* 0 - Use (unverified) client provided host name string.
- * 1 - Use actual client IP address.  HAG() are resolved to IPs at ACF load time.
+ * 1 - Use actual client IP address.  HAG() host names are resolved to IPs.
  */
 LIBCOM_API extern int asCheckClientIP;
 
@@ -103,6 +105,10 @@ LIBCOM_API long epicsStdCall asComputeAllAsg(void);
 LIBCOM_API long epicsStdCall asComputeAsg(ASG *pasg);
 */
 LIBCOM_API long epicsStdCall asCompute(ASCLIENTPVT asClientPvt);
+/* Refresh expired hostname access-group DNS entries and recompute clients.
+ * This is an explicit control-plane operation; ordinary access checks never
+ * perform DNS work.  *changed is set to 1 when any entry was refreshed. */
+LIBCOM_API long epicsStdCall asRefreshHag(unsigned *changed);
 LIBCOM_API int epicsStdCall asDump(
     void (*memcallback)(ASMEMBERPVT,FILE *),
     void (*clientcallback)(ASCLIENTPVT,FILE *),int verbose);
@@ -157,6 +163,9 @@ typedef struct asBase{
     ELLLIST         hagList;
     ELLLIST         asgList;
     struct gphPvt   *phash;
+    /* Private cache state used from asLibRoutines.c; Codacy checks this header alone. */
+    /* cppcheck-suppress unusedStructMember */
+    time_t          hagExpires; /* Earliest refreshable HAG DNS expiry, or 0 */
 } ASBASE;
 
 LIBCOM_API extern volatile ASBASE *pasbase;
@@ -174,7 +183,17 @@ typedef struct uag{
 /*Defs for Host Access Groups*/
 typedef struct{
     ELLNODE         node;
-    char            host[1];
+    /* Private cache state used from asLibRoutines.c; Codacy checks this header alone. */
+    /* cppcheck-suppress unusedStructMember */
+    char            *host;      /* Current host name or resolved IP string */
+    /* cppcheck-suppress unusedStructMember */
+    char            *source;    /* Original HAG host name for refresh, or NULL */
+    /* cppcheck-suppress unusedStructMember */
+    time_t          expires;    /* DNS cache expiry for source */
+    /* cppcheck-suppress unusedStructMember */
+    unsigned char   resolved;
+    /* cppcheck-suppress unusedStructMember */
+    unsigned char   hashAdded;
 } HAGNAME;
 typedef struct hag{
     ELLNODE         node;
