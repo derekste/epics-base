@@ -39,6 +39,14 @@ typedef enum{
     /*For now this is all*/
 } asClientStatus;
 
+/* Rights callbacks run synchronously under the client access lock. Cached
+ * rights queries and operations on independent registrations may be called
+ * recursively. Callbacks must not remove the notified client or its siblings,
+ * or remove/relink members in the active notification traversal.
+ * Policy initialization and HAG refresh must be queued for execution after
+ * the callback returns. asInitialize(),
+ * asInitFile(), asInitFP(), asInitMem() and asRefreshHag() return
+ * S_asLib_InitFailed when called synchronously from a rights callback. */
 typedef void (*ASCLIENTCALLBACK) (ASCLIENTPVT,asClientStatus);
 
 /* The following  routines are macros with the following syntax
