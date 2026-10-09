@@ -209,6 +209,7 @@ TESTS += macLibTest
 
 TESTPROD_HOST += aslibtest
 aslibtest_SRCS += aslibtest.c
+aslibtest_SYS_LIBS_Linux += resolv
 testHarness_SRCS += aslibtest.c
 TESTS += aslibtest
 
