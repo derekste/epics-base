@@ -38,6 +38,7 @@ OP_SYS_CFLAGS += -fno-common
 # Darwin os definition
 #
 OP_SYS_CPPFLAGS += -Ddarwin
+OP_SYS_LDLIBS += -lresolv
 
 #
 # Libraries for command-line editing.

@@ -14,7 +14,7 @@ POSIX_CPPFLAGS = -D_GNU_SOURCE -D_DEFAULT_SOURCE
 POSIX_LDLIBS = -lpthread
 
 OP_SYS_CPPFLAGS += -Dlinux
-OP_SYS_LDLIBS += -lrt -ldl
+OP_SYS_LDLIBS += -lrt -ldl -lresolv
 # Use -rdynamic to maximize symbols available for stacktrace
 OP_SYS_LDFLAGS += -rdynamic
 

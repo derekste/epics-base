@@ -18,6 +18,7 @@ CODE_CPPFLAGS = -D_REENTRANT
 
 POSIX_CPPFLAGS = -D_POSIX_THREADS
 POSIX_LDLIBS = -lpthread
+OP_SYS_LDLIBS += -lresolv
 
 # -D_BSD_SOURCE for gethostname() in unistd.h as needed by cacChannelIO.cpp.
 OP_SYS_CPPFLAGS += -D_BSD_SOURCE

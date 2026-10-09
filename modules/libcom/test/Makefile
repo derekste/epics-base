@@ -209,7 +209,6 @@ TESTS += macLibTest
 
 TESTPROD_HOST += aslibtest
 aslibtest_SRCS += aslibtest.c
-aslibtest_SYS_LIBS_Linux += resolv
 testHarness_SRCS += aslibtest.c
 TESTS += aslibtest
 
@@ -220,10 +219,15 @@ TESTPROD_HOST += asHagConcurrencyTest
 asHagConcurrencyTest_SRCS += asHagConcurrencyTest.c asHagConcurrencyLib.c
 asHagConcurrencyLib_INCLUDES += -I$(TOP)/modules/libcom/src/O.$(T_A)
 asHagConcurrencyLib_INCLUDES += -I$(TOP)/modules/libcom/src/as
+# The private asLib instance needs resolver linkage even with shared libCom.
+ifeq ($(SHARED_LIBRARIES),YES)
+ifneq ($(STATIC_BUILD),YES)
 asHagConcurrencyTest_SYS_LIBS_Darwin += resolv
 asHagConcurrencyTest_SYS_LIBS_Linux += resolv
 asHagConcurrencyTest_SYS_LIBS_freebsd += resolv
 asHagConcurrencyTest_SYS_LIBS_solaris += resolv
+endif
+endif
 TESTS += asHagConcurrencyTest
 endif
 
