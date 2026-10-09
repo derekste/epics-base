@@ -44,6 +44,13 @@ int asCheckClientIP;
 static epicsMutexId asLock;
 #define LOCK epicsMutexMustLock(asLock)
 #define UNLOCK epicsMutexUnlock(asLock)
+/* Parser/input state and policy lifetime are serialized independently of
+ * client access. DNS work must never run while holding asLock. */
+static epicsMutexId asInitLock;
+static epicsThreadPrivateId asClientCallback;
+static epicsThreadOnceId asInitializeOnceFlag = EPICS_THREAD_ONCE_INIT;
+#define INIT_LOCK epicsMutexMustLock(asInitLock)
+#define INIT_UNLOCK epicsMutexUnlock(asInitLock)
 
 /*following must be global because asCa nneeds it*/
 ASBASE volatile *pasbase=NULL;
@@ -71,7 +78,6 @@ static long asUagAddUser(UAG *puag,const char *user);
 static HAG *asHagAdd(const char *hagName);
 static long asHagAddHost(HAG *phag,const char *host);
 static void asHagAddHashEntries(ASBASE *pasbase);
-static int asHagRefreshExpired(ASBASE *pasbase);
 static ASG *asAsgAdd(const char *asgName);
 static long asAsgAddInp(ASG *pasg,const char *inp,int inpIndex);
 static ASGRULE *asAsgAddRule(ASG *pasg,asAccessRights access,int level);
@@ -85,18 +91,37 @@ static long asAsgRuleDisable(ASGRULE *pasgrule);
   asInitialize can be called while access security is already active.
   This is accomplished by doing the following:
 
-  The version pointed to by pasbase is kept as is but locked against changes
+  The version pointed to by pasbase remains available to clients while parsing
   A new version is created and pointed to by pasbasenew
   If anything goes wrong. The original version is kept. This results is some
   wasted space but at least things still work.
   If the new access security configuration is successfully read then:
-     the old memberList is moved from old to new.
+     under the client lock, the old memberList is moved from old to new.
      the old structures are freed.
 */
 static void asInitializeOnce(void *arg)
 {
     osiSockAttach();
     asLock  = epicsMutexMustCreate();
+    asInitLock = epicsMutexMustCreate();
+    asClientCallback = epicsThreadPrivateCreate();
+    if(!asClientCallback)
+        cantProceed("asInitialize: cannot create client callback context");
+}
+
+static int asControlFromCallback(void)
+{
+    epicsThreadOnce(&asInitializeOnceFlag,asInitializeOnce,(void *)0);
+    return epicsThreadPrivateGet(asClientCallback) != NULL;
+}
+
+static void asInvokeClientCallback(ASGCLIENT *client)
+{
+    void *previous = epicsThreadPrivateGet(asClientCallback);
+
+    epicsThreadPrivateSet(asClientCallback, client);
+    (*client->pcallback)(client, asClientCOAR);
+    epicsThreadPrivateSet(asClientCallback, previous);
 }
 
 static char *asStrdupConst(const char *str)
@@ -331,53 +356,63 @@ static void asHagScheduleNextExpiry(ASBASE *pasbase)
     pasbase->hagExpires = found ? next : 0;
 }
 
-static int asHagRefreshExpired(ASBASE *pasbase)
+typedef struct asHagUpdate {
+    struct asHagUpdate *next;
+    HAGNAME *target;
+    HAGNAME value;
+} ASHAGUPDATE;
+
+/* asInitLock keeps the policy/cache entry pointers alive. Only this detached
+ * result is changed during DNS; clients continue using the complete old hash. */
+static ASHAGUPDATE *asHagPrepareRefresh(ASBASE *pasbase)
 {
     HAG *phag;
     HAGNAME *phagname;
     time_t now;
-    int expired = 0;
+    ASHAGUPDATE *updates = NULL;
 
     if(!asCheckClientIP || !pasbase || !pasbase->hagExpires)
-        return 0;
+        return NULL;
 
     now = time(NULL);
     if(now == (time_t)-1)
-        return 0;
+        return NULL;
     if(difftime(now, pasbase->hagExpires) < 0.0)
-        return 0;
+        return NULL;
 
     phag = (HAG *)ellFirst(&pasbase->hagList);
-    while(phag && !expired) {
+    while(phag) {
         phagname = (HAGNAME *)ellFirst(&phag->list);
         while(phagname) {
             if(phagname->source && difftime(now, phagname->expires) >= 0.0) {
-                expired = 1;
-                break;
+                ASHAGUPDATE *update = asCalloc(1, sizeof(*update));
+
+                update->target = phagname;
+                asHagResolveHost(&update->value, phagname->source, now);
+                update->next = updates;
+                updates = update;
             }
             phagname = (HAGNAME *)ellNext(&phagname->node);
         }
         phag = (HAG *)ellNext(&phag->node);
     }
-    if(!expired) {
-        asHagScheduleNextExpiry(pasbase);
-        return 0;
-    }
+    return updates;
+}
 
+/* Caller holds asLock through cache publication and client recomputation. */
+static void asHagCommitRefresh(ASBASE *pasbase, ASHAGUPDATE *updates)
+{
+    ASHAGUPDATE *update;
     asHagDeleteHashEntries(pasbase);
-    phag = (HAG *)ellFirst(&pasbase->hagList);
-    while(phag) {
-        phagname = (HAGNAME *)ellFirst(&phag->list);
-        while(phagname) {
-            if(phagname->source && difftime(now, phagname->expires) >= 0.0)
-                asHagResolveHost(phagname, phagname->source, now);
-            phagname = (HAGNAME *)ellNext(&phagname->node);
-        }
-        phag = (HAG *)ellNext(&phag->node);
+    for(update = updates; update; update = update->next) {
+        HAGNAME *target = update->target;
+
+        asHagSetHost(target, update->value.host, update->value.resolved);
+        target->expires = update->value.expires;
+        update->value.host = NULL;
     }
     asHagAddHashEntries(pasbase);
     asHagScheduleNextExpiry(pasbase);
-    return 1;
 }
 
 long epicsStdCall asInitialize(ASINPUTFUNCPTR inputfunction)
@@ -388,10 +423,11 @@ long epicsStdCall asInitialize(ASINPUTFUNCPTR inputfunction)
     GPHENTRY    *pgphentry;
     UAG         *puag;
     UAGNAME     *puagname;
-    static epicsThreadOnceId asInitializeOnceFlag = EPICS_THREAD_ONCE_INIT;
 
-    epicsThreadOnce(&asInitializeOnceFlag,asInitializeOnce,(void *)0);
-    LOCK;
+    /* A rights callback already holds asLock. Waiting for the control lock
+     * there could deadlock a staged publisher waiting to acquire asLock. */
+    if(asControlFromCallback()) return S_asLib_InitFailed;
+    INIT_LOCK;
     pasbasenew = asCalloc(1,sizeof(ASBASE));
     if(!freeListPvt) freeListInitPvt(&freeListPvt,sizeof(ASGCLIENT),20);
     ellInit(&pasbasenew->uagList);
@@ -402,7 +438,7 @@ long epicsStdCall asInitialize(ASINPUTFUNCPTR inputfunction)
     if(status) {
         status = S_asLib_badConfig;
         /*Not safe to call asFreeAll */
-        UNLOCK;
+        INIT_UNLOCK;
         return(status);
     }
     pasg = (ASG *)ellFirst(&pasbasenew->asgList);
@@ -427,6 +463,7 @@ long epicsStdCall asInitialize(ASINPUTFUNCPTR inputfunction)
     }
     asHagAddHashEntries(pasbasenew);
     asHagScheduleNextExpiry(pasbasenew);
+    LOCK;
     pasbaseold = (ASBASE *)pasbase;
     pasbase = (ASBASE volatile *)pasbasenew;
     if(pasbaseold) {
@@ -449,6 +486,7 @@ long epicsStdCall asInitialize(ASINPUTFUNCPTR inputfunction)
     }
     asActive = TRUE;
     UNLOCK;
+    INIT_UNLOCK;
     return(0);
 }
 
@@ -457,6 +495,7 @@ long epicsStdCall asInitFile(const char *filename,const char *substitutions)
     FILE *fp;
     long status;
 
+    if(asControlFromCallback()) return S_asLib_InitFailed;
     fp = fopen(filename,"r");
     if(!fp) {
         fprintf(stderr, ERL_ERROR " asInitFile: Can't open file '%s'\n", filename);
@@ -514,6 +553,8 @@ long epicsStdCall asInitFP(FILE *fp,const char *substitutions)
     long        status;
     char        **macPairs;
 
+    if(asControlFromCallback()) return S_asLib_InitFailed;
+    INIT_LOCK;
     buffer[0] = 0;
     my_buffer = buffer;
     my_buffer_ptr = my_buffer;
@@ -521,6 +562,7 @@ long epicsStdCall asInitFP(FILE *fp,const char *substitutions)
     if(substitutions) {
         if((status = macCreateHandle(&macHandle,NULL))) {
             errMessage(status,"asInitFP: macCreateHandle error");
+            INIT_UNLOCK;
             return(status);
         }
         macParseDefns(macHandle,substitutions,&macPairs);
@@ -538,6 +580,7 @@ long epicsStdCall asInitFP(FILE *fp,const char *substitutions)
         macDeleteHandle(macHandle);
         macHandle = NULL;
     }
+    INIT_UNLOCK;
     return(status);
 }
 
@@ -562,9 +605,12 @@ long epicsStdCall asInitMem(const char *acf, const char *substitutions)
     long ret = S_asLib_InitFailed;
     if(!acf) return ret;
 
+    if(asControlFromCallback()) return S_asLib_InitFailed;
+    INIT_LOCK;
     membuf = acf;
     ret = asInitialize(&memInputFunction);
     membuf = NULL;
+    INIT_UNLOCK;
 
     return ret;
 }
@@ -724,7 +770,7 @@ long epicsStdCall asRegisterClientCallback(ASCLIENTPVT asClientPvt,
     if(!pasgclient) return(S_asLib_badClient);
     LOCK;
     pasgclient->pcallback = pcallback;
-    (*pasgclient->pcallback)(pasgclient,asClientCOAR);
+    asInvokeClientCallback(pasgclient);
     UNLOCK;
     return(0);
 }
@@ -783,16 +829,28 @@ long epicsStdCall asCompute(ASCLIENTPVT asClientPvt)
 
 long epicsStdCall asRefreshHag(unsigned *changed)
 {
+    ASHAGUPDATE *updates, *next;
     int refreshed;
     long status = 0;
 
     if(changed) *changed = 0;
     if(!asActive) return(S_asLib_asNotActive);
+    if(asControlFromCallback()) return S_asLib_InitFailed;
+    INIT_LOCK;
+    updates = asHagPrepareRefresh((ASBASE *)pasbase);
+    refreshed = updates != NULL;
     LOCK;
-    refreshed = asHagRefreshExpired((ASBASE *)pasbase);
-    if(refreshed)
+    if(refreshed) {
+        asHagCommitRefresh((ASBASE *)pasbase, updates);
         status = asComputeAllAsgPvt();
+    }
     UNLOCK;
+    while(updates) {
+        next = updates->next;
+        free(updates);
+        updates = next;
+    }
+    INIT_UNLOCK;
     if(changed) *changed = !!refreshed;
     return(status);
 }
@@ -1345,7 +1403,7 @@ next_rule:
     pasgclient->access = access;
     pasgclient->trapMask = trapMask;
     if(pasgclient->pcallback && oldaccess!=access) {
-        (*pasgclient->pcallback)(pasgclient,asClientCOAR);
+        asInvokeClientCallback(pasgclient);
     }
     return(0);
 }

@@ -212,6 +212,25 @@ aslibtest_SRCS += aslibtest.c
 testHarness_SRCS += aslibtest.c
 TESTS += aslibtest
 
+# Compile a private asLib instance so the real parser/HAG resolver path can
+# use a deterministic delayed resolver without adding a public library hook.
+ifneq ($(OS_CLASS),WIN32)
+TESTPROD_HOST += asHagConcurrencyTest
+asHagConcurrencyTest_SRCS += asHagConcurrencyTest.c asHagConcurrencyLib.c
+asHagConcurrencyLib_INCLUDES += -I$(TOP)/modules/libcom/src/O.$(T_A)
+asHagConcurrencyLib_INCLUDES += -I$(TOP)/modules/libcom/src/as
+# The private asLib instance needs resolver linkage even with shared libCom.
+ifeq ($(SHARED_LIBRARIES),YES)
+ifneq ($(STATIC_BUILD),YES)
+asHagConcurrencyTest_SYS_LIBS_Darwin += resolv
+asHagConcurrencyTest_SYS_LIBS_Linux += resolv
+asHagConcurrencyTest_SYS_LIBS_freebsd += resolv
+asHagConcurrencyTest_SYS_LIBS_solaris += resolv
+endif
+endif
+TESTS += asHagConcurrencyTest
+endif
+
 TESTPROD_HOST += fdManagerTest
 fdManagerTest_SRCS += fdManagerTest.cpp
 testHarness_SRCS += fdManagerTest.cpp
@@ -355,6 +374,9 @@ TESTFILES += ../multiline-input.txt ../multiline-expect.txt
 endif
 
 include $(TOP)/configure/RULES
+
+asHagConcurrencyLib$(DEP): $(TOP)/modules/libcom/src/O.$(T_A)/asLib.c
+asHagConcurrencyLib$(DEP): $(TOP)/modules/libcom/src/as/asLibRoutines.c
 
 rtemsTestData.c : $(TESTFILES) $(TOOLS)/epicsMakeMemFs.pl
 	$(PERL) $(TOOLS)/epicsMakeMemFs.pl $@ epicsRtemsFSImage $(TESTFILES)

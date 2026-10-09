@@ -45,7 +45,7 @@ USE_STLPORT=NO
 OP_SYS_CFLAGS+=$(STLPORT_CFLAGS_$(USE_STLPORT))
 OP_SYS_LDFLAGS+=$(STLPORT_CFLAGS_$(USE_STLPORT))
 
-OP_SYS_LDLIBS += -lsocket -lnsl
+OP_SYS_LDLIBS += -lsocket -lnsl -lresolv
 OP_SYS_LDLIBS_8 += -ldl -lCrun -lc
 OP_SYS_LDLIBS_9 += -ldl -lCrun -lc
 OP_SYS_LDLIBS_10 += -lCrun -lc
