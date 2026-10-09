@@ -222,6 +222,33 @@ jobs:
       if: runner.os == 'Linux'
     - name: Prepare and compile dependencies
       run: python .ci/cue.py prepare
+    - name: Select matching MinGW runtime
+      if: runner.os == 'Windows' && matrix.cmp == 'gcc'
+      shell: pwsh
+      run: |
+        $compiler = 'C:\Strawberry\c\bin\g++.exe'
+        $runtime = (& $compiler '-print-file-name=libstdc++-6.dll').Trim()
+        if ($LASTEXITCODE -ne 0) { throw 'Unable to query the MinGW runtime' }
+        $candidates = @($runtime,
+          'C:\Strawberry\c\bin\libstdc++-6.dll',
+          'C:\Strawberry\perl\bin\libstdc++-6.dll')
+        $runtime = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+        if (!$runtime) { throw 'Matching Strawberry MinGW runtime not found' }
+        $runtime = (Resolve-Path -LiteralPath $runtime).Path
+        $runtimeDir = Split-Path -Parent $runtime
+        if (!$runtimeDir.StartsWith('C:\Strawberry\', [StringComparison]::OrdinalIgnoreCase)) {
+          throw "Unexpected MinGW runtime directory: $runtimeDir"
+        }
+        $env:PATH = "$runtimeDir;$env:PATH"
+        $runtimeDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        & $compiler --version
+        foreach ($dll in @('libstdc++-6.dll', 'libgcc_s_seh-1.dll', 'libwinpthread-1.dll')) {
+          $resolved = @(& where.exe $dll)
+          if ($LASTEXITCODE -ne 0 -or $resolved[0] -ne (Join-Path $runtimeDir $dll)) {
+            throw "Unexpected MinGW runtime resolution for ${dll}: $resolved"
+          }
+          Write-Host "$dll -> $($resolved[0])"
+        }
     - name: Build main module
       run: python .ci/cue.py build
     - name: Run main module tests
